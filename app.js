@@ -2,7 +2,7 @@
 // Sync: a tiny room row in a Supabase table, polled over plain HTTPS —
 // works on every network. State is synced wholesale with a sequence number.
 const $ = (id) => document.getElementById(id);
-const SSKEY = "justus_session_v4";
+const SSKEY = "justus_session_v5";
 const SB_URL = "https://tucqsqkaougrxiwcsjdz.supabase.co";
 const SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InR1Y3FzcWthb3Vncnhpd2NzamR6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ0ODc0NjQsImV4cCI6MjExMDA2MzQ2NH0.G-drpDREJ4BjRhNc-sEk89iN0EAkpr4tPI5vRkKKJrw";
 const ROOMS = SB_URL + "/rest/v1/justus_rooms";
@@ -119,14 +119,22 @@ let myDisplayName = "";
 let S = null;             // shared state (synced wholesale)
 let pollTimer = null, heartbeatTimer = null;
 let roomSeen = false;
+let blocked = false;
 let writeInFlight = false, writeDirty = false;
 let netErrors = 0;
-const myUid = "u" + Math.random().toString(36).slice(2, 10);
+// A persistent per-browser identity: this is how the app knows you are the
+// host (or the guest) when you come back, even after the browser was closed.
+let myUid = null;
+try { myUid = localStorage.getItem("justus_uid"); } catch (e) {}
+if (!myUid) {
+  myUid = "u" + Math.random().toString(36).slice(2, 12);
+  try { localStorage.setItem("justus_uid", myUid); } catch (e) {}
+}
 
 function freshState(myName) {
   return {
     screen: "lobby",
-    players: { host: { name: myName, score: 0 }, guest: null },
+    players: { host: { name: myName, score: 0, uid: myUid }, guest: null },
     sparks: 0,
     quiz: null,
     td: null,
@@ -141,9 +149,9 @@ const shuffle = (arr) => arr.map((v) => [Math.random(), v]).sort((a, b) => a[0] 
 // ---------------- session persistence ----------------
 function saveSession() {
   if (!me || !roomCode) return;
-  try { sessionStorage.setItem(SSKEY, JSON.stringify({ me, roomCode, name: myDisplayName, S })); } catch (e) {}
+  try { localStorage.setItem(SSKEY, JSON.stringify({ me, roomCode, name: myDisplayName, S })); } catch (e) {}
 }
-function clearSession() { try { sessionStorage.removeItem(SSKEY); } catch (e) {} }
+function clearSession() { try { localStorage.removeItem(SSKEY); } catch (e) {} }
 
 // ---------------- banner ----------------
 function showBanner(text) {
@@ -228,23 +236,39 @@ async function pollOnce() {
   }
   const incoming = row.state;
   if (!incoming) return;
-  if (!S) {
-    S = incoming;
-    afterAdopt();
-    render();
-    return;
-  }
-  if ((incoming._seq || 0) > (S._seq || 0)) {
-    S = incoming;
+  let adopted = false;
+  if (!S) { S = incoming; adopted = true; }
+  else if ((incoming._seq || 0) > (S._seq || 0)) { S = incoming; adopted = true; }
+  if (adopted) {
+    // A third browser (both seats taken by other people) may not sneak in.
+    if (S.players.host && S.players.host.uid !== myUid && S.players.guest && S.players.guest.uid !== myUid) {
+      blocked = true;
+      stopLoops();
+      clearSession();
+      S = null;
+      roomSeen = false;
+      render();
+      setHomeStatus("That room already has two players — create your own room instead.");
+      return;
+    }
     afterAdopt();
     render();
   }
 }
 
+// Your seat in the room comes from your browser identity, not from which
+// button you tapped — rejoining with the code still makes the host the host.
+function resolveRole() {
+  if (!S) return;
+  if (S.players.host && S.players.host.uid === myUid) me = "host";
+  else if (S.players.guest && S.players.guest.uid === myUid) me = "guest";
+}
+
 // After adopting a state (mainly: a guest claims the empty guest slot)
 function afterAdopt() {
+  resolveRole();
   if (me === "guest" && S && !S.players.guest) {
-    S.players.guest = { name: myDisplayName, score: 0 };
+    S.players.guest = { name: myDisplayName, score: 0, uid: myUid };
     S._seq = (S._seq || 0) + 1;
     S._by = myUid;
     writeState();
@@ -264,15 +288,14 @@ function roomClosed() {
 function startLoops() {
   stopLoops();
   pollTimer = setInterval(pollOnce, POLL_MS);
-  if (me === "host") {
-    heartbeatTimer = setInterval(() => {
-      api("?code=eq." + encodeURIComponent(roomCode), {
-        method: "PATCH",
-        headers: { Prefer: "return=minimal" },
-        body: JSON.stringify({ updated_at: new Date().toISOString() }),
-      }).catch(() => {});
-    }, 25000);
-  }
+  heartbeatTimer = setInterval(() => {
+    if (me !== "host" || !roomCode) return;
+    api("?code=eq." + encodeURIComponent(roomCode), {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ updated_at: new Date().toISOString() }),
+    }).catch(() => {});
+  }, 25000);
 }
 function stopLoops() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
@@ -295,6 +318,7 @@ $("createBtn").addEventListener("click", async () => {
   if (!name) { setHomeStatus("Type your name first 💞"); return; }
   me = "host";
   myDisplayName = name;
+  blocked = false;
   setHomeStatus("Creating your room…");
   for (let attempt = 0; attempt < 5; attempt++) {
     const code = makeCode();
@@ -333,6 +357,7 @@ $("joinBtn").addEventListener("click", () => {
   myDisplayName = name;
   roomCode = code;
   roomSeen = false;
+  blocked = false;
   S = null;
   clearSession();
   saveSession();
@@ -341,7 +366,7 @@ $("joinBtn").addEventListener("click", () => {
   startLoops();
   pollOnce();
   setTimeout(() => {
-    if (!S && !roomSeen) { stopLoops(); setHomeStatus("Room not found — check the code, and make sure your partner created the room first."); }
+    if (!S && !roomSeen && !blocked) { stopLoops(); setHomeStatus("Room not found — check the code, and make sure your partner created the room first."); }
   }, 9000);
 });
 
@@ -350,7 +375,7 @@ async function leaveRoom() {
   try {
     if (me === "host") {
       await api("?code=eq." + encodeURIComponent(roomCode), { method: "DELETE" });
-    } else if (S && S.players.guest && S.players.guest.name === myDisplayName) {
+    } else if (S && S.players.guest && S.players.guest.uid === myUid) {
       S.players.guest = null;
       S._seq = (S._seq || 0) + 1;
       await api("?code=eq." + encodeURIComponent(roomCode), {
@@ -587,7 +612,7 @@ function renderTd() {
 // ---------------- restore session on load ----------------
 (function restore() {
   let saved = null;
-  try { saved = JSON.parse(sessionStorage.getItem(SSKEY) || "null"); } catch (e) {}
+  try { saved = JSON.parse(localStorage.getItem(SSKEY) || "null"); } catch (e) {}
   if (saved && saved.roomCode && saved.me) {
     me = saved.me;
     roomCode = saved.roomCode;
