@@ -1,8 +1,11 @@
-// JustUs — a game for two. Two phones, one room code (PeerJS, no server).
+// JustUs — a game for two. Two phones, one room code.
+// Transport: MQTT over secure websockets via public brokers (works on any
+// network — no peer-to-peer hole punching). Game state is synced wholesale
+// and retained by the broker, so either phone can reload and catch up.
 const $ = (id) => document.getElementById(id);
-const PREFIX = "justus-v1-";
+const SSKEY = "justus_session_v3";
+const BROKERS = ["wss://broker.emqx.io:8084/mqtt", "wss://test.mosquitto.org:8081"];
 const CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-const SSKEY = "justus_session_v2";
 
 // ---------------- content ----------------
 const QUIZ = [
@@ -108,12 +111,14 @@ const DARES = {
 
 // ---------------- state ----------------
 let me = null;            // 'host' | 'guest'
-let peer = null, conn = null;
 let roomCode = "";
 let myDisplayName = "";
-let connected = false;
-let rejoinTimer = null;
+let client = null;        // mqtt client
+let brokerIdx = 0;
+let everConnected = false;
+let roomSeen = false;     // guest: proof the room exists (host presence or state)
 let S = null;             // shared state (synced wholesale)
+const myUid = "u" + Math.random().toString(36).slice(2, 10);
 
 function freshState(myName) {
   return {
@@ -122,15 +127,14 @@ function freshState(myName) {
     sparks: 0,
     quiz: null,
     td: null,
+    _seq: 0,
+    _by: myUid,
   };
 }
 const other = (r) => (r === "host" ? "guest" : "host");
 const pname = (r) => (S.players[r] ? S.players[r].name : "your partner");
 const shuffle = (arr) => arr.map((v) => [Math.random(), v]).sort((a, b) => a[0] - b[0]).map((x) => x[1]);
-
-function send(msg) { if (conn && conn.open) conn.send(msg); }
-function broadcast() { send({ t: "state", S }); }
-function mutate(fn) { fn(); broadcast(); render(); }
+const topic = (kind) => `justus/v1/${roomCode}/${kind}`;
 
 // ---------------- session persistence ----------------
 function saveSession() {
@@ -156,148 +160,146 @@ function hideBanner() {
   if (d) d.style.display = "none";
 }
 
-// ---------------- connection ----------------
+// ---------------- transport (MQTT) ----------------
+function publish(kind, obj, retained) {
+  if (!client || !client.connected) return;
+  client.publish(topic(kind), JSON.stringify(obj), { retain: !!retained, qos: 0 });
+}
+function broadcast() {
+  if (S) publish("state", { from: myUid, t: "state", S }, true);
+}
+function mutate(fn) {
+  fn();
+  S._seq = (S._seq || 0) + 1;
+  S._by = myUid;
+  broadcast();
+  render();
+}
+
+function connectTransport() {
+  if (typeof mqtt === "undefined") {
+    setHomeStatus("The game library could not load — check your internet and refresh the page.");
+    return;
+  }
+  const url = BROKERS[brokerIdx % BROKERS.length];
+  everConnected = false;
+  client = mqtt.connect(url, {
+    clientId: "justus-" + myUid + "-" + Math.random().toString(36).slice(2, 6),
+    reconnectPeriod: 2000,
+    connectTimeout: 8000,
+    clean: true,
+  });
+
+  const failoverTimer = setTimeout(() => {
+    if (!everConnected && BROKERS.length > 1) {
+      brokerIdx++;
+      try { client.end(true); } catch (e) {}
+      connectTransport();
+    }
+  }, 9000);
+
+  client.on("connect", () => {
+    everConnected = true;
+    clearTimeout(failoverTimer);
+    hideBanner();
+    client.subscribe([topic("state"), topic("hello"), topic("host")], () => {
+      if (me === "host") {
+        publish("host", { from: myUid, name: myDisplayName }, true);
+        broadcast();
+      } else {
+        publish("hello", { from: myUid, name: myDisplayName }, true);
+        if (S) broadcast();
+      }
+      render();
+    });
+  });
+  client.on("reconnect", () => showBanner("💔 Connection interrupted — reconnecting… don't close the page."));
+  client.on("offline", () => showBanner("💔 Connection interrupted — reconnecting… don't close the page."));
+  client.on("message", (tp, payload) => {
+    let msg;
+    try { msg = JSON.parse(payload.toString()); } catch (e) { return; }
+    if (!msg || msg.from === myUid) return;
+    if (tp === topic("host")) {
+      roomSeen = true;
+      hideBanner();
+      if (me === "guest" && !S) { /* host exists; state will follow via retained */ }
+      render();
+    }
+    if (tp === topic("hello") && me === "host" && S) {
+      roomSeen = true;
+      if (!S.players.guest) { S.players.guest = { name: msg.name || "Partner", score: 0 }; mutate(() => {}); }
+      else if (msg.name && S.players.guest.name !== msg.name) { S.players.guest.name = msg.name; mutate(() => {}); }
+      else broadcast();
+    }
+    if (tp === topic("state") && msg.S) {
+      roomSeen = true;
+      hideBanner();
+      const incoming = msg.S;
+      if (!S || (incoming._seq || 0) >= (S._seq || 0)) {
+        S = incoming;
+        render();
+      }
+    }
+  });
+}
+
+// ---------------- home actions ----------------
 function makeCode() {
   let c = "";
-  for (let i = 0; i < 4; i++) c += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
+  for (let i = 0; i < 5; i++) c += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
   return c;
 }
 function updateRoomPill() {
   if (roomCode) { $("roomCodeLabel").textContent = roomCode; $("roomPill").classList.remove("hidden"); }
 }
-function destroyPeer() { if (peer) { try { peer.destroy(); } catch (e) {} peer = null; } }
-
-function wireConn(c) {
-  conn = c;
-  conn.on("open", () => {
-    connected = true;
-    hideBanner();
-    if (me === "guest") send({ t: "hello", name: myDisplayName });
-    if (me === "host") broadcast();
-    render();
-  });
-  conn.on("data", (msg) => {
-    if (!msg || typeof msg !== "object") return;
-    if (msg.t === "hello" && me === "host") {
-      if (!S.players.guest) S.players.guest = { name: msg.name || "Partner", score: 0 };
-      else if (msg.name) S.players.guest.name = msg.name;
-      broadcast();
-      render();
-    }
-    if (msg.t === "state") {
-      S = msg.S;
-      connected = true;
-      hideBanner();
-      render();
-    }
-  });
-  conn.on("close", () => { connected = false; onConnLost(); });
-  conn.on("error", () => { connected = false; onConnLost(); });
-}
-
-function onConnLost() {
-  if (!me) return;
-  showBanner("💔 Connection interrupted — trying to reconnect… don't close the page.");
-  if (me === "guest") startRejoin();
-}
-
-function createHostPeer(code, isRestore, attempt) {
-  destroyPeer();
-  peer = new Peer(PREFIX + code);
-  peer.on("open", () => {
-    roomCode = code;
-    if (!S) S = freshState(myDisplayName);
-    updateRoomPill();
-    hideBanner();
-    render();
-  });
-  peer.on("connection", (c) => wireConn(c));
-  peer.on("disconnected", () => {
-    showBanner("💔 Connection interrupted — reconnecting…");
-    try { peer.reconnect(); } catch (e) {}
-  });
-  peer.on("error", (err) => {
-    if (err.type === "unavailable-id") {
-      if (isRestore && attempt < 6) setTimeout(() => createHostPeer(code, true, attempt + 1), 2500);
-      else if (!isRestore) createHostPeer(makeCode(), false, 0);
-      else setHomeStatus("That room got stuck — use Leave room and create a fresh one.");
-    } else if (err.type === "network" || err.type === "server-error") {
-      showBanner("Network hiccup — retrying…");
-      setTimeout(() => { try { peer.reconnect(); } catch (e) {} }, 3000);
-    }
-  });
-}
-
-function doGuestConnect() {
-  if (!peer || peer.destroyed || peer.disconnected) return;
-  const c = peer.connect(PREFIX + roomCode, { reliable: true });
-  wireConn(c);
-}
-
-function createGuestPeer() {
-  destroyPeer();
-  peer = new Peer();
-  peer.on("open", () => doGuestConnect());
-  peer.on("disconnected", () => {
-    showBanner("💔 Connection interrupted — reconnecting…");
-    try { peer.reconnect(); } catch (e) {}
-  });
-  peer.on("error", (err) => {
-    if (err.type === "peer-unavailable") {
-      if (!S) setHomeStatus("Room not found — check the code, and make sure your partner created the room first and is still on the lobby page.");
-      // if S exists we are mid-game: the rejoin loop keeps trying quietly
-    } else if (err.type === "network" || err.type === "server-error") {
-      setTimeout(() => { try { peer.reconnect(); } catch (e) {} }, 3000);
-    }
-  });
-}
-
-function startRejoin() {
-  if (rejoinTimer) return;
-  rejoinTimer = setInterval(() => {
-    if (connected) { clearInterval(rejoinTimer); rejoinTimer = null; return; }
-    if (!peer || peer.destroyed) createGuestPeer();
-    else if (peer.disconnected) { try { peer.reconnect(); } catch (e) {} }
-    else doGuestConnect();
-  }, 4000);
-}
-
 function myName() { return $("nameInput").value.trim(); }
 
 $("createBtn").addEventListener("click", () => {
   const name = myName();
   if (!name) { setHomeStatus("Type your name first 💞"); return; }
-  if (typeof Peer === "undefined") { setHomeStatus("The game library could not load — check your internet and refresh the page."); return; }
+  if (typeof mqtt === "undefined") { setHomeStatus("The game library could not load — check your internet and refresh the page."); return; }
   me = "host";
   myDisplayName = name;
-  S = null;
+  roomCode = makeCode();
+  roomSeen = true;
+  S = freshState(name);
   clearSession();
-  setHomeStatus("Creating your room…");
-  createHostPeer(makeCode(), false, 0);
-  setTimeout(() => { if (!S) setHomeStatus("Still connecting… make sure your internet is on, then wait a few more seconds."); }, 9000);
+  updateRoomPill();
+  setHomeStatus("");
+  connectTransport();
+  render();
 });
 
 $("joinBtn").addEventListener("click", () => {
   const name = myName();
   const code = $("codeInput").value.trim().toUpperCase();
   if (!name) { setHomeStatus("Type your name first 💞"); return; }
-  if (code.length !== 4) { setHomeStatus("Enter the 4-letter room code."); return; }
-  if (typeof Peer === "undefined") { setHomeStatus("The game library could not load — check your internet and refresh the page."); return; }
+  if (code.length !== 5) { setHomeStatus("Enter the 5-letter room code."); return; }
+  if (typeof mqtt === "undefined") { setHomeStatus("The game library could not load — check your internet and refresh the page."); return; }
   me = "guest";
   myDisplayName = name;
   roomCode = code;
+  roomSeen = false;
   S = null;
   clearSession();
   saveSession();
   updateRoomPill();
   setHomeStatus("Joining room " + code + "…");
-  createGuestPeer();
-  setTimeout(() => { if (!S) setHomeStatus("Still looking for the room… check the code, and that your partner created it first and hasn't closed the page."); }, 8000);
+  connectTransport();
+  setTimeout(() => {
+    if (!S && !roomSeen) setHomeStatus("Room not found — check the code, and make sure your partner created the room first.");
+    else if (!S) setHomeStatus("Found your partner — loading the room…");
+  }, 9000);
 });
 
 function leaveRoom() {
+  if (client && client.connected) {
+    publish("state", "", true);
+    publish("hello", "", true);
+    publish("host", "", true);
+  }
+  if (client) { try { client.end(true); } catch (e) {} }
   clearSession();
-  destroyPeer();
   location.reload();
 }
 $("leaveBtn").addEventListener("click", leaveRoom);
@@ -324,7 +326,7 @@ function render() {
 }
 
 function renderLobby() {
-  $("lobbyCode").textContent = roomCode || "····";
+  $("lobbyCode").textContent = roomCode || "·····";
   $("chipHost").querySelector("span").textContent = S.players.host.name;
   const g = S.players.guest;
   $("chipGuest").querySelector("span").textContent = g ? g.name : "waiting…";
@@ -333,7 +335,7 @@ function renderLobby() {
   $("startBtn").classList.toggle("hidden", !canStart);
   $("lobbyHint").innerHTML = g
     ? `<b>${g.name}</b> is here! 💞` + (me === "host" ? " Tap start when you're ready." : " Waiting for " + S.players.host.name + " to start…")
-    : "Tell your partner to open this same page, type their name, enter this code and tap <b>Join room</b>. Keep this page open while you play.";
+    : "Tell your partner to open this same page, type their name, enter this code and tap <b>Join room</b>.";
 }
 
 $("startBtn").addEventListener("click", () => mutate(() => { S.screen = "menu"; }));
@@ -525,15 +527,15 @@ function renderTd() {
 (function restore() {
   let saved = null;
   try { saved = JSON.parse(sessionStorage.getItem(SSKEY) || "null"); } catch (e) {}
-  if (saved && saved.roomCode && saved.me && typeof Peer !== "undefined") {
+  if (saved && saved.roomCode && saved.me && typeof mqtt !== "undefined") {
     me = saved.me;
     roomCode = saved.roomCode;
     myDisplayName = saved.name || "";
     S = saved.S || null;
+    roomSeen = me === "host" || !!S;
     if (myDisplayName) $("nameInput").value = myDisplayName;
     updateRoomPill();
-    if (me === "host") createHostPeer(roomCode, true, 0);
-    else { createGuestPeer(); startRejoin(); }
+    connectTransport();
   }
   render();
 })();

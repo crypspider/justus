@@ -37,7 +37,7 @@
       <button class="btn btn-grad btn-block" id="createBtn">Create a room</button>
       <div class="divider"><span>or join your partner</span></div>
       <label class="lbl" for="codeInput">Room code</label>
-      <input id="codeInput" class="input code" type="text" maxlength="4" placeholder="ABCD" autocomplete="off">
+      <input id="codeInput" class="input code" type="text" maxlength="5" placeholder="ABCDE" autocomplete="off">
       <button class="btn btn-light btn-block" id="joinBtn">Join room</button>
       <p class="status" id="homeStatus"></p>
     </div>
@@ -108,7 +108,7 @@
 
 <footer class="foot">JustUs — made for two 💞</footer>
 
-<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
